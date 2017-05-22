@@ -422,7 +422,7 @@ void processData(struct sniffer_buf2 *sniffer)
   
   if(msg.type == MSG_Data || msg.type == MSG_Data_Ack) //standard data msg
   {
-    if(msg.dst == ESP.getChipId() && msg.type == MSG_Data)
+    if((msg.dst == ESP.getChipId() || msg.dst == 0xffffffff) && msg.type == MSG_Data)
     {
       //i am the reciever! yaaaaaay
       Serial.printf("I am the dst (dst(%d) == chipid(%d))! Sending ack...\n", msg.dst, ESP.getChipId());     
@@ -433,7 +433,7 @@ void processData(struct sniffer_buf2 *sniffer)
       createPacket(result, data, 2, msg.src, MSG_Data_Ack);
       int res = wifi_send_pkt_freedom(result, sizeof(result), 0); 
     }
-    else if(msg.dst == ESP.getChipId() && msg.type == MSG_Data_Ack)
+    else if((msg.dst == ESP.getChipId() || msg.dst == 0xffffffff) && msg.type == MSG_Data_Ack)
     {      
       uint16_t ackSeq = (sniffer->buf[22] << 8) | sniffer->buf[23];
       if(ackSeq == waitForAck)
@@ -444,7 +444,8 @@ void processData(struct sniffer_buf2 *sniffer)
         timer.disable(ackTimer);
       }
     }
-    else
+    
+    if(msg.dst != ESP.getChipId())
     {
       if(msg.ttl > 0 && msg.ttl < START_TTL+1) //not
       {
@@ -539,10 +540,13 @@ void sendDataMsg(uint8_t data, size_t length, uint32_t destination)
   int res = wifi_send_pkt_freedom(result, sizeof(result), 0);
   waitForAck = seq;
   Serial.printf("sending data (seqnum: %d, res: %d, len %d) to &d\n", seq, res, length, destination);
-  
-  sendBuffer = result;
-  sendBufferLength = sizeof(beacon_raw)+length;
-  ackTimer = timer.setTimer(100, resendMsg, 1);
+
+  if(destination != 0xffffffff)
+  {
+    sendBuffer = result;
+    sendBufferLength = sizeof(beacon_raw)+length;
+    ackTimer = timer.setTimer(100, resendMsg, 1);
+  }
 }
 
 void sendKeepAlive()
