@@ -39,6 +39,7 @@ WiFiUDP udp;
 time_t timestamp = 0;
 
 uint16_t waitForAck = 0;
+uint8_t retrySendCounter = 5;
 
 SimpleTimer timer;
 int updateModeTimer;
@@ -439,6 +440,7 @@ void processData(struct sniffer_buf2 *sniffer)
       {
         Serial.printf("Got ack for %d\n", ackSeq));
         waitForAck = 0;
+        retrySendCounter = 5;
         timer.disable(ackTimer);
       }
     }
@@ -511,6 +513,14 @@ void ICACHE_RAM_ATTR promisc_cb(uint8_t *buf, uint16_t len)
 
 void resendMsg()
 {
+  retrySendCounter--;
+  if(retrySendCounter <= 0) 
+  {    
+    Serial.printf("failed to reach destination for data. (seqnum: %d, res: %d, len %d) dest: &d\n", seq, res, length, destination);
+    retrySendCounter = 5;
+    waitForAck = 0;
+    return;
+  }
   int res = wifi_send_pkt_freedom(sendBuffer, sendBufferLength, 0);
   waitForAck = seq;
   Serial.printf("re-sending data (seqnum: %d, res: %d, len %d) to &d\n", seq, res, length, destination);
