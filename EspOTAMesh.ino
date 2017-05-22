@@ -288,9 +288,9 @@ bool goToRequestMode(uint32_t otaHost)
   }
   Serial.printf("local %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n", bufmd5[0],bufmd5[1],bufmd5[2],bufmd5[3],bufmd5[4],bufmd5[5],bufmd5[6],bufmd5[7],bufmd5[8],bufmd5[9],bufmd5[10],bufmd5[11],md5Inc[12],bufmd5[13],bufmd5[14],bufmd5[15]);
 
-  if(md5Inc[0] != bufmd5[0] || md5Inc[1] != bufmd5[1])
+  if(memcmp(md5Inc, bufmd5, 16))
   {
-    Serial.printf("md5[0]/md5[1] not equal! %02x %02x - %02x %02x\n", md5Inc[0], bufmd5[0], md5Inc[1], bufmd5[1]);
+    Serial.printf("md5 not equal!\n");
   }
   else
   {
