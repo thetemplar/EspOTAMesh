@@ -66,6 +66,7 @@ enum MsgTypes : uint8_t
 {
 	MSG_Unknown = 0x00,
 	MSG_Data = 0x01,
+  MSG_Data_Ack = 0x02,
 	MSG_RequestOTA = 0x1A,
 	MSG_AcceptOTA = 0x1B,
   MSG_KeepAlive = 0xFF

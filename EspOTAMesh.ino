@@ -38,7 +38,7 @@ WiFiUDP udp;
 
 time_t timestamp = 0;
 
-
+uint16_t waitForAck = 0;
 
 SimpleTimer timer;
 int updateModeTimer;
@@ -47,6 +47,7 @@ int requestUpdateTimer;
 bool requestedUpdate = false;
 int inUpdateTimeoutTimer;
 int ntpUpdateTimer;
+int ackTimer;
 
 bool inProcess = false;
 int ledState;
@@ -56,7 +57,17 @@ struct sniffer_buf2 *sniffer;
 uint16_t seqnum = 0x000;
 std::map<uint32_t,uint16_t> lastSeqNum;
 
-void createPacket(uint8_t* result, uint8_t *buf, uint16_t len, uint32_t dst, uint8_t type)
+static inline uint32_t intDisable()
+{
+    return xt_rsil(15);
+    
+}
+static inline void intEnable(uint32_t state)
+{
+    xt_wsr_ps(state);
+}
+
+uint16_t createPacket(uint8_t* result, uint8_t *buf, uint16_t len, uint32_t dst, uint8_t type)
 {
   memcpy(&result[0], &beacon_raw[0], sizeof(beacon_raw));
   memcpy(&result[sizeof(beacon_raw)], &buf[0], len);
@@ -82,14 +93,17 @@ void createPacket(uint8_t* result, uint8_t *buf, uint16_t len, uint32_t dst, uin
   result[22] = (seqnum & 0x0f) << 4;
   result[23] = (seqnum & 0xff0) >> 4;
 
+  uint16_t seqTmp = seqnum;
   seqnum++;
   if (seqnum > 0xfff)
-    seqnum = 0;
+    seqnum = 1;
 
   result[39] += len;
   result[42] = VERSION;
   result[43] = START_TTL;
   result[44] = type;
+
+  return seqTmp;
 }
 
 void forwardPacket(uint8_t* result)
@@ -108,11 +122,6 @@ void forwardPacket(uint8_t* result)
 
   //decrease ttl
   result[43]--;
-}
-
-void addLog(char* msg)
-{
-  
 }
 
 void sendNTPpacket()
@@ -410,17 +419,34 @@ void processData(struct sniffer_buf2 *sniffer)
   lastSeqNum[msg.src] = msg.seq;
 
   
-  if(msg.type == MSG_Data) //standard data msg
+  if(msg.type == MSG_Data || msg.type == MSG_Data_Ack) //standard data msg
   {
-    if(msg.dst == ESP.getChipId())
+    if(msg.dst == ESP.getChipId() && msg.type == MSG_Data)
     {
       //i am the reciever! yaaaaaay
-      Serial.printf("I am the dst (dst(%d) == chipid(%d))!\n", msg.dst, ESP.getChipId());      
+      Serial.printf("I am the dst (dst(%d) == chipid(%d))! Sending ack...\n", msg.dst, ESP.getChipId());     
+      
+      //send reply
+      uint8_t result[sizeof(beacon_raw) + 2];      
+      uint8_t data[8] = {sniffer->buf[22], sniffer->buf[23]}; //ack with msg.src & msg.seq
+      createPacket(result, data, 2, msg.src, MSG_Data_Ack);
+      int res = wifi_send_pkt_freedom(result, sizeof(result), 0); 
+    }
+    else if(msg.dst == ESP.getChipId() && msg.type == MSG_Data_Ack)
+    {      
+      uint16_t ackSeq = (sniffer->buf[22] << 8) | sniffer->buf[23];
+      if(ackSeq == waitForAck)
+      {
+        Serial.printf("Got ack for %d\n", ackSeq));
+        waitForAck = 0;
+        timer.disable(ackTimer);
+      }
     }
     else
     {
-      if(msg.ttl > 0 && msg.ttl < START_TTL+1 && false) //not
+      if(msg.ttl > 0 && msg.ttl < START_TTL+1) //not
       {
+        delayMicroseconds(2000+random(6000)); //2-8ms delay to avoid parallel-fwd of multiple nodes
         //forward!
         Serial.printf("Forward to dst(%d) from me(%d) with new ttl:%d!\n", msg.dst, ESP.getChipId(), (msg.ttl-1));
         forwardPacket(sniffer->buf);
@@ -465,9 +491,9 @@ void processData(struct sniffer_buf2 *sniffer)
   }
 }
 
-void promisc_cb(uint8_t *buf, uint16_t len)
+void ICACHE_RAM_ATTR promisc_cb(uint8_t *buf, uint16_t len)
 {
-  noInterrupts();
+  uint32_t old_ints = intDisable();
   if (len == 128 && buf[12+4] == 0xef && !inProcess ){
     inProcess = true;  
     sniffer = (struct sniffer_buf2*) buf;
@@ -480,16 +506,42 @@ void promisc_cb(uint8_t *buf, uint16_t len)
       inProcess = false; 
     }
   }
-  interrupts();
+  intEnable(old_ints);
+}
+
+void resendMsg()
+{
+  int res = wifi_send_pkt_freedom(sendBuffer, sendBufferLength, 0);
+  waitForAck = seq;
+  Serial.printf("re-sending data (seqnum: %d, res: %d, len %d) to &d\n", seq, res, length, destination);
+  
+  ackTimer = timer.setTimer(100, resendMsg, 1);
+}
+
+uint8_t* sendBuffer;
+size_t sendBufferLength;
+
+void sendDataMsg(uint8_t data, size_t length, uint32_t destination)
+{
+  if(inUpdateMode) return;
+  uint8_t result[sizeof(beacon_raw)+length];
+  uint16_t seq = createPacket(result, data, length, destination, MSG_Data);
+  int res = wifi_send_pkt_freedom(result, sizeof(result), 0);
+  waitForAck = seq;
+  Serial.printf("sending data (seqnum: %d, res: %d, len %d) to &d\n", seq, res, length, destination);
+  
+  sendBuffer = result;
+  sendBufferLength = sizeof(beacon_raw)+length;
+  ackTimer = timer.setTimer(100, resendMsg, 1);
 }
 
 void sendKeepAlive()
 {
   if(inUpdateMode) return;
   uint8_t result[sizeof(beacon_raw)];
-  createPacket(result, {}, 0, 0xffffffff, MSG_KeepAlive);
-  int res = wifi_send_pkt_freedom(result, sizeof(beacon_raw), 0);
-  Serial.printf("sending KeepAlive (seqnum: %d, res: %d)\n", seqnum, res);
+  uint16_t seq = createPacket(result, {}, 0, 0xffffffff, MSG_KeepAlive);
+  int res = wifi_send_pkt_freedom(result, sizeof(result), 0);
+  Serial.printf("sending KeepAlive (seqnum: %d, res: %d)\n", seq, res);
 }
 
 
@@ -560,8 +612,6 @@ void setup() {
 
 unsigned long previousMillis = 0;        // will store last time LED was updated
 void loop() {   
-  delay(1);
-  
   unsigned long currentMillis = millis();
   if (currentMillis - previousMillis >= 3000) {
     // save the last time you blinked the LED
