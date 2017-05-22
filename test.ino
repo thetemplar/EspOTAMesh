@@ -12,28 +12,44 @@ extern "C" {
 #define MSG_TYPE 0x00
 #define CHANNEL 1
 
+#define TIMEOUT_HOST 60
+#define TIMEOUT_REQUEST 20
+#define KEEPALIVE_INTERVAL 20
 
 #include "FS.h"
 #include <ESP8266WiFi.h>
-#include <ESP8266mDNS.h>
-#include <WiFiUdp.h>
-#include <ArduinoOTA.h>
 #include <WiFiClient.h>
 #include <SimpleTimer.h>
 #include <map>
+#include <WiFiUdp.h>
+#include <time.h>
 #include "defines.h"
-#include "ideOta.h"
 
 WiFiClient client;
 WiFiServer server(9900);
 
+char IspSsid[] = "ssvl_dev";  
+char IspPass[] = "winchester";
+
+const char* ntpServerName = "time.nist.gov";
+byte ntpPacketBuffer[48];
+IPAddress timeServerIP;
+WiFiUDP udp;
+
+time_t timestamp = 0;
+
 
 
 SimpleTimer timer;
+int updateModeTimer;
+bool inUpdateMode = false;
+int requestUpdateTimer;
 bool requestedUpdate = false;
+int inUpdateTimeoutTimer;
+int ntpUpdateTimer;
 
 bool inProcess = false;
-bool blinkOn = false;
+int ledState;
 
 struct sniffer_buf2 *sniffer;
 
@@ -51,13 +67,13 @@ void createPacket(uint8_t* result, uint8_t *buf, uint16_t len, uint32_t dst, uin
   result[4 + 4] = (dst >> 8) & 0xFF;
   result[4 + 5] = (dst) & 0xFF;
 
-  //transmit
+  //src
   result[10 + 2] = (ESP.getChipId() >> 24) & 0xFF;
   result[10 + 3] = (ESP.getChipId() >> 16) & 0xFF;
   result[10 + 4] = (ESP.getChipId() >> 8) & 0xFF;
   result[10 + 5] = (ESP.getChipId()) & 0xFF;
 
-  //src
+  //transmitc
   result[16 + 2] = (ESP.getChipId() >> 24) & 0xFF;
   result[16 + 3] = (ESP.getChipId() >> 16) & 0xFF;
   result[16 + 4] = (ESP.getChipId() >> 8) & 0xFF;
@@ -71,8 +87,9 @@ void createPacket(uint8_t* result, uint8_t *buf, uint16_t len, uint32_t dst, uin
     seqnum = 0;
 
   result[39] += len;
-  result[44] = type;
   result[42] = VERSION;
+  result[43] = START_TTL;
+  result[44] = type;
 }
 
 void forwardPacket(uint8_t* result)
@@ -93,7 +110,70 @@ void forwardPacket(uint8_t* result)
   result[43]--;
 }
 
+void addLog(char* msg)
+{
+  
+}
 
+void sendNTPpacket()
+{
+  if(inUpdateMode) return;
+  WiFi.hostByName(ntpServerName, timeServerIP); 
+  Serial.println("sending NTP packet...");
+  // set all bytes in the buffer to 0
+  memset(ntpPacketBuffer, 0, 48);
+  // Initialize values needed to form NTP request
+  // (see URL above for details on the packets)
+  ntpPacketBuffer[0] = 0b11100011;   // LI, Version, Mode
+  ntpPacketBuffer[1] = 0;     // Stratum, or type of clock
+  ntpPacketBuffer[2] = 6;     // Polling Interval
+  ntpPacketBuffer[3] = 0xEC;  // Peer Clock Precision
+  // 8 bytes of zero for Root Delay & Root Dispersion
+  ntpPacketBuffer[12]  = 49;
+  ntpPacketBuffer[13]  = 0x4E;
+  ntpPacketBuffer[14]  = 49;
+  ntpPacketBuffer[15]  = 52;
+
+  // all NTP fields have been given values, now
+  // you can send a packet requesting a timestamp:
+  udp.beginPacket(timeServerIP, 123); //NTP requests are to port 123
+  udp.write(ntpPacketBuffer, 48);
+  udp.endPacket();
+
+  int timeout = 20;
+  while(timeout > 0)
+  {
+    int cb = udp.parsePacket();
+
+    if (cb > 0) {
+      Serial.print("ntp packet received, length=");
+      Serial.println(cb);
+      // We've received a packet, read the data from it
+      udp.read(ntpPacketBuffer, 48); // read the packet into the buffer
+  
+      //the timestamp starts at byte 40 of the received packet and is four bytes,
+      // or two words, long. First, esxtract the two words:
+  
+      unsigned long highWord = word(ntpPacketBuffer[40], ntpPacketBuffer[41]);
+      unsigned long lowWord = word(ntpPacketBuffer[42], ntpPacketBuffer[43]);
+      // combine the four bytes (two words) into a long integer
+      // this is NTP time (seconds since Jan 1 1900):
+      unsigned long secsSince1900 = highWord << 16 | lowWord;
+  
+      // Unix time starts on Jan 1 1970. In seconds, that's 2208988800:
+      const unsigned long seventyYears = 2208988800UL;
+      // subtract seventy years:
+      unsigned long epoch = secsSince1900 - seventyYears;
+
+      struct tm  ts;
+      ts = *localtime((time_t*)&epoch);      
+      Serial.printf ("Current local time and date: %s\n", asctime(&ts));
+      return;
+    }
+    timeout--;
+    delay(1000);
+  }
+}
 
 void flashFirmware()
 {
@@ -163,8 +243,7 @@ bool goToRequestMode(uint32_t otaHost)
   uint8_t md5Inc[16];
   File f2 = SPIFFS.open("/fw.bin", "w");
   uint8_t buf[1024];
-  int timeout = 100;
-  while(!client.available()) { delay(100); timeout--; if (timeout <= 0) {stopHostMode(); return false; } }
+  while(!client.available()) {delay(1); timer.run();}
   while(client.available()) {
     size_t len = client.readBytes(buf, 1024);
     f2.write(buf, len);
@@ -178,8 +257,7 @@ bool goToRequestMode(uint32_t otaHost)
     WiFi.disconnect();
     return false;
   }
-  timeout = 100;
-  while(!client.available()) { delay(100); timeout--; if (timeout <= 0) {stopHostMode(); return false; } }
+  while(!client.available()) {delay(1); timer.run();}
   while(client.available()) {
     size_t len = client.readBytes(md5Inc, 16);  
     Serial.printf("receiving %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n", md5Inc[0],md5Inc[1],md5Inc[2],md5Inc[3],md5Inc[4],md5Inc[5],md5Inc[6],md5Inc[7],md5Inc[8],md5Inc[9],md5Inc[10],md5Inc[11],md5Inc[12],md5Inc[13],md5Inc[14],md5Inc[15]);  
@@ -204,16 +282,20 @@ bool goToRequestMode(uint32_t otaHost)
   if(md5Inc[0] != bufmd5[0] || md5Inc[1] != bufmd5[1])
   {
     Serial.printf("md5[0]/md5[1] not equal! %02x %02x - %02x %02x\n", md5Inc[0], bufmd5[0], md5Inc[1], bufmd5[1]);
-    return false;
   }
-    
-  Serial.println("ready to flash!");
+  else
+  {
+    Serial.println("ready to flash!");
+    flashFirmware();
+  }
+  
   return true;
 }
 
 void goToHostMode(uint32_t otaClient)
 {
-  timer.setTimer(100000, stopHostMode, 1);
+  inUpdateMode = true;
+  updateModeTimer = timer.setInterval(TIMEOUT_HOST * 1000, stopHostMode);
   wifi_promiscuous_enable(0);
   IPAddress ip(192,168,0,1);
   IPAddress gateway(192,168,0,1);
@@ -226,8 +308,7 @@ void goToHostMode(uint32_t otaClient)
   WiFi.softAP(ap, pw);
 
   server.begin();
-  int timeout = 100;
-  while(!server.hasClient()) { delay(100); timeout--; if (timeout <= 0) {stopHostMode(); return; } }
+  while(!server.hasClient()) {delay(1); timer.run();}
   if (server.hasClient())
   {
     delay(1);    
@@ -254,9 +335,8 @@ void goToHostMode(uint32_t otaClient)
     delay(1000);    
     serverClient.stop();
   }
-
-  timeout = 100;
-  while(!server.hasClient()) { delay(100); timeout--; if (timeout <= 0) {stopHostMode(); return; } }
+  
+  while(!server.hasClient()) {delay(1); timer.run();}
   if (server.hasClient())
   {
     delay(1);    
@@ -292,20 +372,24 @@ void stopHostMode()
   WiFi.mode(WIFI_STA); 
   Serial.println("softAPdisconnect -> WIFI_STA");
   wifi_promiscuous_enable(1);
+  inUpdateMode = false;
+  timer.disable(updateModeTimer);
 }
 
 void resetRequestedUpdate()
 {
   Serial.println("got no update :(");    
   requestedUpdate = false;
+  timer.disable(requestUpdateTimer);
 }
 
 void processData(struct sniffer_buf2 *sniffer)
 {
+  if(sniffer->buf[4] != 0xef || sniffer->buf[5] != 0x50) return;
   msgData msg;
   msg.dst = (sniffer->buf[6]  << 24) | (sniffer->buf[7]  << 16) | (sniffer->buf[8]  << 8) | sniffer->buf[9];
   msg.src = (sniffer->buf[12] << 24) | (sniffer->buf[13] << 16) | (sniffer->buf[14] << 8) | sniffer->buf[15];
-  msg.tns = (sniffer->buf[18] << 24) | (sniffer->buf[19] << 16) | (sniffer->buf[20] << 8) | sniffer->buf[21];
+  msg.trs = (sniffer->buf[18] << 24) | (sniffer->buf[19] << 16) | (sniffer->buf[20] << 8) | sniffer->buf[21];
   msg.seq = (sniffer->buf[22] << 8) | sniffer->buf[23];
   msg.ver = sniffer->buf[42];
   msg.ttl = sniffer->buf[43];
@@ -335,18 +419,16 @@ void processData(struct sniffer_buf2 *sniffer)
     }
     else
     {
-      if(msg.ttl > 0 && msg.ttl < START_TTL+1) //not
+      if(msg.ttl > 0 && msg.ttl < START_TTL+1 && false) //not
       {
         //forward!
-        int wait = 500+random(2500);
-        delayMicroseconds(wait);
-        Serial.printf("Forward to dst(%d) from me(%d) with new ttl:%d after %d us!\n", msg.dst, ESP.getChipId(), (msg.ttl-1), wait);
+        Serial.printf("Forward to dst(%d) from me(%d) with new ttl:%d!\n", msg.dst, ESP.getChipId(), (msg.ttl-1));
         forwardPacket(sniffer->buf);
         int res = wifi_send_pkt_freedom(sniffer->buf, sizeof(beacon_raw)+ msg.dataLength, 0);
       }
     }
   }
-  else if(msg.type == MSG_RequestOTA && msg.dst == ESP.getChipId()) //req. OTA 
+  else if(msg.type == MSG_RequestOTA && msg.dst == ESP.getChipId() && !inUpdateMode) //req. OTA 
   {
     //src wants to get a OTA
     //stop beacons, stop promisc_cb, go STA, wait for connect, 
@@ -358,18 +440,16 @@ void processData(struct sniffer_buf2 *sniffer)
     int res = wifi_send_pkt_freedom(result, sizeof(beacon_raw), 0); 
     goToHostMode(msg.src);
   }
-  else if(msg.type == MSG_AcceptOTA && msg.dst == ESP.getChipId() && requestedUpdate) //accept OTA-request
+  else if(msg.type == MSG_AcceptOTA && msg.dst == ESP.getChipId() && !inUpdateMode && requestedUpdate) //accept OTA-request
   {
     Serial.println("whoohoo, we get updated!");
-    if(goToRequestMode(msg.src))
-      flashFirmware();
-    else
-      Serial.println("  ...not (error) :(");
+    goToRequestMode(msg.src);
   }
+  else if(msg.type == MSG_KeepAlive)
+  {}
   else
   {
-    if(msg.type != MSG_KeepAlive)
-      Serial.println("Unknown/Unwanted Messagetype");
+    Serial.println("Unknown/Unwanted Messagetype");
   }
 
   
@@ -377,7 +457,7 @@ void processData(struct sniffer_buf2 *sniffer)
   {
     Serial.println("there is a new version out there! fuck the rest, gimmegimme!");
     requestedUpdate = true;
-    timer.setTimer(20000, resetRequestedUpdate, 1);
+    requestUpdateTimer = timer.setInterval(TIMEOUT_REQUEST * 1000, resetRequestedUpdate);
     uint8_t result[sizeof(beacon_raw)];
     createPacket(result, {}, 0, msg.src, MSG_RequestOTA);
     int res = wifi_send_pkt_freedom(result, sizeof(beacon_raw), 0);
@@ -388,13 +468,12 @@ void processData(struct sniffer_buf2 *sniffer)
 void promisc_cb(uint8_t *buf, uint16_t len)
 {
   noInterrupts();
-  if (len == 128 && !inProcess){
+  if (len == 128 && buf[12+4] == 0xef && !inProcess ){
     inProcess = true;  
     sniffer = (struct sniffer_buf2*) buf;
     if (sniffer->buf[0] == 0x80 /*beacon*/&& sniffer->buf[37] == 0x00 /*hidden ssid*/&& sniffer->buf[38] == 0xDD /*vendor info*/&& sniffer->buf[4] == 0xef /*magic word1*/&& sniffer->buf[5] == 0x50/*magic word2*/)
     {
       //dont process data here in interrupt  
-      //buffer is called from main routine  
     }
     else
     {
@@ -404,53 +483,102 @@ void promisc_cb(uint8_t *buf, uint16_t len)
   interrupts();
 }
 
-void send()
+void sendKeepAlive()
 {
+  if(inUpdateMode) return;
   uint8_t result[sizeof(beacon_raw)];
   createPacket(result, {}, 0, 0xffffffff, MSG_KeepAlive);
-  int res = wifi_send_pkt_freedom(result, sizeof(result), 0);
-  Serial.printf("sending (seqnum: %d, res: %d)\n", seqnum, res);
+  int res = wifi_send_pkt_freedom(result, sizeof(beacon_raw), 0);
+  Serial.printf("sending KeepAlive (seqnum: %d, res: %d)\n", seqnum, res);
+}
+
+
+void setupIsp()
+{
+  Serial.print("Connecting to ISP ");
+  Serial.println(IspSsid);
+  WiFi.begin(IspSsid, IspPass);
+
+  uint8_t timeout = 10;
+  while (WiFi.status() != WL_CONNECTED && timeout > 0) {
+    delay(500);
+    Serial.print(".");
+    timeout--;
+  }
+  Serial.println("");
+  if(timeout == 0)
+  {
+    Serial.println("No connection to ISP");
+  }
+  else
+  {  
+    Serial.println("WiFi connected to ISP");
+    Serial.println("IP address: ");
+    Serial.println(WiFi.localIP());
+  
+    Serial.println("Starting UDP");
+    udp.begin(2390);
+    Serial.print("Local port: ");
+    Serial.println(udp.localPort());
+    sendNTPpacket();
+    udp.stop();
+  }
+  setupFreedom();
 }
 
 void setupFreedom()
 {
+  Serial.println("Setting up Freedom Mode");
+  udp.stop();
   WiFi.mode(WIFI_STA); 
-  wifi_set_channel(CHANNEL);
+  wifi_set_channel(1);
   wifi_set_phy_mode(PHY_MODE_11B);
-  
   wifi_promiscuous_enable(0);
-  // Set up promiscuous callback
   wifi_set_promiscuous_rx_cb(promisc_cb);
   wifi_promiscuous_enable(1);
 }
 
 void setup() {
+  
   Serial.begin(115200);
   delay(2000);
-  
-  //setupIdeOta();
-  //timer.setTimer(100000, setupFreedom, 1);
-  setupFreedom();
-  
+  Serial.printf("\n\nSDK version: %s - chipId: %d - fw-version: %d\n", system_get_sdk_version(), ESP.getChipId(), VERSION);
   pinMode(2, OUTPUT);
-  digitalWrite(2, HIGH);
-
+  digitalWrite(2, LOW);
   SPIFFS.begin();
   
   // Promiscuous works only with station mode
   seqnum = ESP.getChipId() & 0xfff; //semi-rnd init
   
-  Serial.printf("\n\nSDK version:%s - chipId: %d - Firmware version: %d\n", system_get_sdk_version(), ESP.getChipId(), VERSION);
-  
-  timer.setInterval(10000, send);  
+  WiFi.mode(WIFI_STA); 
+  setupIsp();
+  setupFreedom();
+      
+  //timer.setInterval(21600 * 1000 /* = 6 Stunden*/, setupIsp);
+  timer.setInterval(KEEPALIVE_INTERVAL * 1000, sendKeepAlive);
 }
 
-
-void loop() { 
+unsigned long previousMillis = 0;        // will store last time LED was updated
+void loop() {   
   delay(1);
-  ArduinoOTA.handle();
-  timer.run();
+  
+  unsigned long currentMillis = millis();
+  if (currentMillis - previousMillis >= 3000) {
+    // save the last time you blinked the LED
+    previousMillis = currentMillis;
 
+    // if the LED is off turn it on and vice-versa:
+    if (ledState == LOW) {
+      ledState = HIGH;
+    } else {
+      ledState = LOW;
+    }
+
+    // set the LED with the ledState of the variable:
+    digitalWrite(2, ledState);
+  }
+  
+  timer.run();
   if(inProcess)
   {
     processData(sniffer);
@@ -462,10 +590,7 @@ void loop() {
 
     if(c == 's')
     {
-      uint8_t result[sizeof(beacon_raw)];
-      createPacket(result, {}, 0, 0, MSG_Unknown);
-      int res = wifi_send_pkt_freedom(result, sizeof(beacon_raw), 0);
-      Serial.printf("sending (seqnum: %d, res: %d)\n", seqnum, res);
+      sendKeepAlive();
     }
     if(c == 'x')
     {
@@ -486,8 +611,26 @@ void loop() {
         f.println(millis());
         Serial.println(millis());
       }
+      f.close();      
+    }
+    if(c == 'r')
+    {      
+      File f = SPIFFS.open("/f.txt", "r");
+      if (!f) {
+          Serial.println("file open failed");
+      } 
+      else
+      {
+        Serial.println("====== Reading from SPIFFS file =======");
+        // write 10 strings to file
+        for (int i=1; i<=10; i++){
+          String s=f.readStringUntil('\n');
+          Serial.print(i);
+          Serial.print(":");
+          Serial.println(s);
+        }
+      }
       f.close();
-      
     }
     if(c == 'v')
     {      
@@ -510,25 +653,6 @@ void loop() {
     if(c == 'e')
     {      
       wifi_promiscuous_enable(1);
-    }
-    if(c == 'r')
-    {      
-      File f = SPIFFS.open("/f.txt", "r");
-      if (!f) {
-          Serial.println("file open failed");
-      } 
-      else
-      {
-        Serial.println("====== Reading from SPIFFS file =======");
-        // write 10 strings to file
-        for (int i=1; i<=10; i++){
-          String s=f.readStringUntil('\n');
-          Serial.print(i);
-          Serial.print(":");
-          Serial.println(s);
-        }
-      }
-      f.close();
     }
     if(c == '5')
     {      
@@ -569,10 +693,6 @@ void loop() {
       } else {
           Serial.println("Flash Chip configuration ok.\n");
       }
-
-      
-      Serial.println("======       IP ADDRESS        ========");
-      Serial.println(WiFi.localIP());
       Serial.println("====== Getting filesystem info ========");
       Serial.print("ESP.getFreeSketchSpace(): ");
       Serial.println(ESP.getFreeSketchSpace());
