@@ -10,11 +10,11 @@ extern "C" {
 //uint8_t VERSION;
 #define START_TTL 0x05
 #define MSG_TYPE 0x00
-#define CHANNEL 1
 
 #define TIMEOUT_HOST 60
 #define TIMEOUT_REQUEST 20
 #define KEEPALIVE_INTERVAL 20
+#define CHANNEL 1
 
 #include "FS.h"
 #include <ESP8266WiFi.h>
@@ -531,7 +531,7 @@ void setupFreedom()
   Serial.println("Setting up Freedom Mode");
   udp.stop();
   WiFi.mode(WIFI_STA); 
-  wifi_set_channel(1);
+  wifi_set_channel(CHANNEL);
   wifi_set_phy_mode(PHY_MODE_11B);
   wifi_promiscuous_enable(0);
   wifi_set_promiscuous_rx_cb(promisc_cb);

@@ -53,7 +53,7 @@ struct sniffer_buf2 {
 struct msgData {
   uint32_t dst;
   uint32_t src;
-  uint32_t tns;
+  uint32_t trs;
   uint16_t seq;
   uint8_t ver;
   uint8_t ttl;
