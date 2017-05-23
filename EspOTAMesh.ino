@@ -13,7 +13,7 @@ extern "C" {
 
 #define TIMEOUT_HOST 60
 #define TIMEOUT_REQUEST 20
-#define KEEPALIVE_INTERVAL 20
+#define KEEPALIVE_INTERVAL 60
 #define CHANNEL 1
 
 #include "FS.h"
@@ -40,6 +40,10 @@ time_t timestamp = 0;
 
 uint16_t waitForAck = 0;
 uint8_t retrySendCounter = 5;
+
+uint8_t* sendBuffer;
+size_t sendBufferLength;
+
 
 SimpleTimer timer;
 int updateModeTimer;
@@ -91,8 +95,8 @@ uint16_t createPacket(uint8_t* result, uint8_t *buf, uint16_t len, uint32_t dst,
   result[16 + 4] = (ESP.getChipId() >> 8) & 0xFF;
   result[16 + 5] = (ESP.getChipId()) & 0xFF;
 
-  result[22] = (seqnum & 0x0f) << 4;
-  result[23] = (seqnum & 0xff0) >> 4;
+  result[22] = (seqnum >> 8) & 0xFF;
+  result[23] = (seqnum) & 0xFF;
 
   uint16_t seqTmp = seqnum;
   seqnum++;
@@ -425,20 +429,27 @@ void processData(struct sniffer_buf2 *sniffer)
     if((msg.dst == ESP.getChipId() || msg.dst == 0xffffffff) && msg.type == MSG_Data)
     {
       //i am the reciever! yaaaaaay
-      Serial.printf("I am the dst (dst(%d) == chipid(%d))! Sending ack...\n", msg.dst, ESP.getChipId());     
+      Serial.printf("I am the dst (dst(%d) == chipid(%d))! Sending ack...\n", msg.dst, ESP.getChipId());  
+      Serial.printf("My data is:\n");    
+      for(int i = 0; i < msg.dataLength; i++)
+        Serial.printf("%02x ", msg.data[i]); 
+      Serial.printf("\n\n");  
       
       //send reply
-      uint8_t result[sizeof(beacon_raw) + 2];      
-      uint8_t data[8] = {sniffer->buf[22], sniffer->buf[23]}; //ack with msg.src & msg.seq
+      uint8_t result[sizeof(beacon_raw) + 2];    
+      uint8_t data[2] = {(msg.seq >> 8) & 0xFF, msg.seq & 0xFF}; //ack with msg.src & msg.seq
       createPacket(result, data, 2, msg.src, MSG_Data_Ack);
-      int res = wifi_send_pkt_freedom(result, sizeof(result), 0); 
+      int res = wifi_send_pkt_freedom(result, sizeof(result), 0);
+      /*for(int i = 0; i < sizeof(result); i++)
+        Serial.printf("%02x ", result[i]); 
+      Serial.printf("\n"); */
     }
-    else if((msg.dst == ESP.getChipId() || msg.dst == 0xffffffff) && msg.type == MSG_Data_Ack)
+    else if((msg.dst == ESP.getChipId() || msg.dst == 0xffffffff) && msg.type == MSG_Data_Ack && msg.dataLength == 2)
     {      
-      uint16_t ackSeq = (sniffer->buf[22] << 8) | sniffer->buf[23];
+      uint16_t ackSeq = (msg.data[0] << 8) | msg.data[1];
+      Serial.printf("Got ack for %d (waiting for %d)\n", ackSeq, waitForAck);
       if(ackSeq == waitForAck)
       {
-        Serial.printf("Got ack for %d\n", ackSeq));
         waitForAck = 0;
         retrySendCounter = 5;
         timer.disable(ackTimer);
@@ -449,7 +460,7 @@ void processData(struct sniffer_buf2 *sniffer)
     {
       if(msg.ttl > 0 && msg.ttl < START_TTL+1) //not
       {
-        delayMicroseconds(2000+random(6000)); //2-8ms delay to avoid parallel-fwd of multiple nodes
+        //delayMicroseconds(2000+random(6000)); //2-8ms delay to avoid parallel-fwd of multiple nodes
         //forward!
         Serial.printf("Forward to dst(%d) from me(%d) with new ttl:%d!\n", msg.dst, ESP.getChipId(), (msg.ttl-1));
         forwardPacket(sniffer->buf);
@@ -497,16 +508,19 @@ void processData(struct sniffer_buf2 *sniffer)
 void ICACHE_RAM_ATTR promisc_cb(uint8_t *buf, uint16_t len)
 {
   uint32_t old_ints = intDisable();
-  if (len == 128 && buf[12+4] == 0xef && !inProcess ){
-    inProcess = true;  
-    sniffer = (struct sniffer_buf2*) buf;
-    if (sniffer->buf[0] == 0x80 /*beacon*/&& sniffer->buf[37] == 0x00 /*hidden ssid*/&& sniffer->buf[38] == 0xDD /*vendor info*/&& sniffer->buf[4] == 0xef /*magic word1*/&& sniffer->buf[5] == 0x50/*magic word2*/)
-    {
-      //dont process data here in interrupt  
-    }
-    else
-    {
-      inProcess = false; 
+  if (len == 128 && buf[12+4] == 0xef && buf[12] == 0x80){
+    Serial.printf("*");
+    if (!inProcess ){
+      inProcess = true;  
+      sniffer = (struct sniffer_buf2*) buf;
+      if (sniffer->buf[0] == 0x80 /*beacon*/&& sniffer->buf[37] == 0x00 /*hidden ssid*/&& sniffer->buf[38] == 0xDD /*vendor info*/&& sniffer->buf[4] == 0xef /*magic word1*/&& sniffer->buf[5] == 0x50/*magic word2*/)
+      {
+        //dont process data here in interrupt  
+      }
+      else
+      {
+        inProcess = false; 
+      }
     }
   }
   intEnable(old_ints);
@@ -517,35 +531,31 @@ void resendMsg()
   retrySendCounter--;
   if(retrySendCounter <= 0) 
   {    
-    Serial.printf("failed to reach destination for data. (seqnum: %d, res: %d, len %d) dest: &d\n", seq, res, length, destination);
+    Serial.printf("failed to reach destination for data. (seqnum: %d, len %d)\n", waitForAck, sendBufferLength);
     retrySendCounter = 5;
     waitForAck = 0;
     return;
   }
   int res = wifi_send_pkt_freedom(sendBuffer, sendBufferLength, 0);
-  waitForAck = seq;
-  Serial.printf("re-sending data (seqnum: %d, res: %d, len %d) to &d\n", seq, res, length, destination);
+  Serial.printf("re-sending data (seqnum: %d, len %d)\n", waitForAck, sendBufferLength);
   
-  ackTimer = timer.setTimer(100, resendMsg, 1);
+  ackTimer = timer.setTimer(200, resendMsg, 1);
 }
 
-uint8_t* sendBuffer;
-size_t sendBufferLength;
-
-void sendDataMsg(uint8_t data, size_t length, uint32_t destination)
+void sendDataMsg(uint8_t* data, size_t length, uint32_t destination)
 {
   if(inUpdateMode) return;
   uint8_t result[sizeof(beacon_raw)+length];
   uint16_t seq = createPacket(result, data, length, destination, MSG_Data);
   int res = wifi_send_pkt_freedom(result, sizeof(result), 0);
   waitForAck = seq;
-  Serial.printf("sending data (seqnum: %d, res: %d, len %d) to &d\n", seq, res, length, destination);
+  Serial.printf("sending data (seqnum: %d, len %d) to %d\n", seq, length, destination);
 
   if(destination != 0xffffffff)
   {
     sendBuffer = result;
     sendBufferLength = sizeof(beacon_raw)+length;
-    ackTimer = timer.setTimer(100, resendMsg, 1);
+    ackTimer = timer.setTimer(200, resendMsg, 1);
   }
 }
 
@@ -561,6 +571,7 @@ void sendKeepAlive()
 
 void setupIsp()
 {
+  WiFi.mode(WIFI_STA); 
   Serial.print("Connecting to ISP ");
   Serial.println(IspSsid);
   WiFi.begin(IspSsid, IspPass);
@@ -613,15 +624,24 @@ void setup() {
   digitalWrite(2, LOW);
   SPIFFS.begin();
   
+  File f = SPIFFS.open("/test.ino.bin", "r");
+  if (f) {
+    Serial.println("New Firmware 'test.ino.bin' found! Rename to 'fw.bin' and flashing....");
+    SPIFFS.remove("/fw.bin");
+    SPIFFS.rename("/test.ino.bin", "/fw.bin");
+    flashFirmware();
+  } 
+  
   // Promiscuous works only with station mode
   seqnum = ESP.getChipId() & 0xfff; //semi-rnd init
   
   WiFi.mode(WIFI_STA); 
-  setupIsp();
+  //setupIsp();
   setupFreedom();
       
   //timer.setInterval(21600 * 1000 /* = 6 Stunden*/, setupIsp);
-  timer.setInterval(KEEPALIVE_INTERVAL * 1000, sendKeepAlive);
+  sendKeepAlive();
+  timer.setInterval(KEEPALIVE_INTERVAL * 1000 + (ESP.getChipId() & 0xfff), sendKeepAlive);
 }
 
 unsigned long previousMillis = 0;        // will store last time LED was updated
@@ -654,7 +674,8 @@ void loop() {
 
     if(c == 's')
     {
-      sendKeepAlive();
+      uint8_t data[4] = { 0xde, 0xad, 0xbe, 0xef };
+      sendDataMsg(data, 4, 1337432);
     }
     if(c == 'x')
     {
