@@ -113,6 +113,7 @@ uint16_t createPacket(uint8_t* result, uint8_t *buf, uint16_t len, uint32_t dst,
 
 void forwardPacket(uint8_t* result)
 {
+  
   if(result[43] == 0) //double safty. if ttl is == 0, then make packet invalid
   {
     result[0] = 0;
@@ -397,6 +398,31 @@ void resetRequestedUpdate()
   timer.disable(requestUpdateTimer);
 }
 
+int port4 = LOW;
+int port13 = LOW;
+void processCommand(uint8_t data[251], uint8_t dataLength)
+{
+  if(data[0] == 0xfa) //fire argument
+  {
+    switch (data[1])
+    {
+      case 0x01: digitalWrite(4, HIGH); delay(200); digitalWrite(4, LOW); Serial.println("toggle short (4)"); break;
+      case 0x02: digitalWrite(4, !digitalRead(4)); Serial.println("switch (4)"); break;
+      case 0x03: digitalWrite(4, HIGH); delay(500); digitalWrite(4, LOW); Serial.println("toggle long (4)");  break;
+      
+      case 0x11: digitalWrite(13, HIGH); delay(200); digitalWrite(13, LOW); Serial.println("toggle short (13)");  break;
+      case 0x12: digitalWrite(13, !digitalRead(13)); Serial.println("switch (13)"); break;
+      case 0x13: digitalWrite(13, HIGH); delay(500); digitalWrite(13, LOW); Serial.println("toggle long (13)");  break;
+      
+      case 0x21: digitalWrite(4, HIGH); digitalWrite(13, HIGH); delay(200); digitalWrite(4, LOW); digitalWrite(13, LOW); Serial.println("toggle short (both)");  break;
+      case 0x22: digitalWrite(4, !digitalRead(4)); digitalWrite(!digitalRead(13), HIGH); Serial.println("switch (both)"); break;
+      case 0x23: digitalWrite(4, HIGH); digitalWrite(13, HIGH); delay(500); digitalWrite(4, LOW); digitalWrite(13, LOW); Serial.println("toggle long (both)");  break;
+    }
+  }
+}
+
+int32_t queuedForward = -1;
+uint8_t forwardBuf[112];
 void processData(struct sniffer_buf2 *sniffer)
 {
   if(sniffer->buf[4] != 0xef || sniffer->buf[5] != 0x50) return;
@@ -434,6 +460,14 @@ void processData(struct sniffer_buf2 *sniffer)
       for(int i = 0; i < msg.dataLength; i++)
         Serial.printf("%02x ", msg.data[i]); 
       Serial.printf("\n\n");  
+
+      if (ledState == LOW) {
+        ledState = HIGH;
+      } else {
+        ledState = LOW;
+      }
+
+      processCommand(msg.data, msg.dataLength);
       
       //send reply
       uint8_t result[sizeof(beacon_raw) + 2];    
@@ -456,15 +490,23 @@ void processData(struct sniffer_buf2 *sniffer)
       }
     }
     
+    yield();
     if(msg.dst != ESP.getChipId())
     {
       if(msg.ttl > 0 && msg.ttl < START_TTL+1) //not
       {
         //delayMicroseconds(2000+random(6000)); //2-8ms delay to avoid parallel-fwd of multiple nodes
         //forward!
-        Serial.printf("Forward to dst(%d) from me(%d) with new ttl:%d!\n", msg.dst, ESP.getChipId(), (msg.ttl-1));
-        forwardPacket(sniffer->buf);
-        int res = wifi_send_pkt_freedom(sniffer->buf, sizeof(beacon_raw)+ msg.dataLength, 0);
+        queuedForward = sizeof(beacon_raw) + msg.dataLength;
+        memcpy(forwardBuf, sniffer->buf, sizeof(beacon_raw)+ msg.dataLength);
+        forwardPacket(forwardBuf);
+        Serial.printf("Forward %d bytes\n", queuedForward);
+        //forwardPacket(sniffer->buf);
+        //int res = wifi_send_pkt_freedom(sniffer->buf, sizeof(beacon_raw)+ queuedForward, 0);
+  
+        int res = wifi_send_pkt_freedom(forwardBuf, queuedForward, 0);
+        queuedForward = -1;
+        //int res = wifi_send_pkt_freedom(sniffer->buf, sizeof(beacon_raw)+ msg.dataLength, 0);
       }
     }
   }
@@ -505,12 +547,12 @@ void processData(struct sniffer_buf2 *sniffer)
   }
 }
 
-void ICACHE_RAM_ATTR promisc_cb(uint8_t *buf, uint16_t len)
+void promisc_cb(uint8_t *buf, uint16_t len)
 {
   uint32_t old_ints = intDisable();
   if (len == 128 && buf[12+4] == 0xef && buf[12] == 0x80){
     Serial.printf("*");
-    if (!inProcess ){
+    if (!inProcess && queuedForward == -1){
       inProcess = true;  
       sniffer = (struct sniffer_buf2*) buf;
       if (sniffer->buf[0] == 0x80 /*beacon*/&& sniffer->buf[37] == 0x00 /*hidden ssid*/&& sniffer->buf[38] == 0xDD /*vendor info*/&& sniffer->buf[4] == 0xef /*magic word1*/&& sniffer->buf[5] == 0x50/*magic word2*/)
@@ -603,6 +645,18 @@ void setupIsp()
   setupFreedom();
 }
 
+void fire()
+{
+  uint32_t dest = 0x0018f667;
+    
+  uint8_t cmd = 0x01;
+    
+  uint8_t result[sizeof(beacon_raw) + 2];    
+  uint8_t data[2] = {0xFA, cmd};
+  createPacket(result, data, 2, dest, 0x01);
+  int res = wifi_send_pkt_freedom(result, sizeof(result), 0);
+}
+
 void setupFreedom()
 {
   Serial.println("Setting up Freedom Mode");
@@ -616,12 +670,13 @@ void setupFreedom()
 }
 
 void setup() {
-  
+  pinMode(2, OUTPUT);
+  pinMode(4, OUTPUT);
+  pinMode(13, OUTPUT);
+  digitalWrite(2, LOW);
   Serial.begin(115200);
   delay(2000);
   Serial.printf("\n\nSDK version: %s - chipId: %d - fw-version: %d\n", system_get_sdk_version(), ESP.getChipId(), VERSION);
-  pinMode(2, OUTPUT);
-  digitalWrite(2, LOW);
   SPIFFS.begin();
   
   File f = SPIFFS.open("/test.ino.bin", "r");
@@ -642,24 +697,27 @@ void setup() {
   //timer.setInterval(21600 * 1000 /* = 6 Stunden*/, setupIsp);
   sendKeepAlive();
   timer.setInterval(KEEPALIVE_INTERVAL * 1000 + (ESP.getChipId() & 0xfff), sendKeepAlive);
+  
+  digitalWrite(2, HIGH);
 }
 
 unsigned long previousMillis = 0;        // will store last time LED was updated
 void loop() {   
   unsigned long currentMillis = millis();
-  if (currentMillis - previousMillis >= 3000) {
+  if (currentMillis - previousMillis >= 1000) {
     // save the last time you blinked the LED
     previousMillis = currentMillis;
-
+    /*
     // if the LED is off turn it on and vice-versa:
     if (ledState == LOW) {
       ledState = HIGH;
     } else {
       ledState = LOW;
-    }
+    }*/
 
     // set the LED with the ledState of the variable:
     digitalWrite(2, ledState);
+    
   }
   
   timer.run();
@@ -668,7 +726,7 @@ void loop() {
     processData(sniffer);
     inProcess = false;
   }
-  
+  /*
   if (Serial.available()) {          // got anything from Linux?        
     char c = (char)Serial.read();    // read from Linux  
 
@@ -804,5 +862,5 @@ void loop() {
           f.close();
       }
     }
-  }
+  }*/
 }
